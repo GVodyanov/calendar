@@ -1,5 +1,5 @@
 <!--
-  - SPDX-FileCopyrightText: 2024 Nextcloud GmbH and Nextcloud contributors
+  - SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
   - SPDX-License-Identifier: AGPL-3.0-or-later
 -->
 
@@ -425,46 +425,46 @@ export default {
 
 <style lang="scss" scoped>
 .delegation-modal {
-	padding: 20px 24px;
+	padding: calc(var(--default-grid-baseline) * 5) calc(var(--default-grid-baseline) * 6);
 
 	&__title {
 		margin-top: 0;
-		margin-bottom: 16px;
+		margin-bottom: calc(var(--default-grid-baseline) * 4);
 	}
 
 	&__loading {
-		margin-top: 12px;
+		margin-top: calc(var(--default-grid-baseline) * 3);
 	}
 
 	&__list {
 		list-style: none;
 		padding: 0;
-		margin: 0 0 8px;
+		margin: 0 0 calc(var(--default-grid-baseline) * 2);
 	}
 
 	&__empty {
 		color: var(--color-text-maxcontrast);
 		font-style: italic;
-		margin: 8px 0;
+		margin: calc(var(--default-grid-baseline) * 2) 0;
 	}
 
 	&__add-button {
-		margin-top: 12px;
+		margin-top: calc(var(--default-grid-baseline) * 3);
 	}
 }
 
 .delegation-add {
-	padding: 4px 0;
+	padding: var(--default-grid-baseline) 0;
 
 	&__description {
-		margin-top: 12px;
+		margin-top: calc(var(--default-grid-baseline) * 3);
 		color: var(--color-text-maxcontrast);
 	}
 
 	&__option {
 		display: flex;
 		align-items: center;
-		gap: 10px;
+		gap: calc(var(--default-grid-baseline) * 2);
 		width: 100%;
 	}
 
