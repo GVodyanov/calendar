@@ -3,21 +3,54 @@
 ## Context
 
 The `GVodyanov/calendar` frontend already implements the full delegation UI on top of the
-CalDAV proxy-principal system. Two gaps in `nextcloud/server` must be closed before the
+CalDAV proxy-principal system. Three gaps in `nextcloud/server` must be closed before the
 feature is end-to-end functional. Everything else (database layer, `group-member-set`
 read/write, `group-membership`, individual Calendar ACL, user search) is already
 implemented.
 
 ---
 
-## Scope — exactly two files must change
+## ✅ Will delegated calendars appear in the delegate's sidebar?
+
+**Yes.** Here is the exact data-flow that proves it:
+
+```
+[Alice adds Bob as delegate]
+  → PROPPATCH /dav/principals/users/alice/calendar-proxy-write
+      sets group-member-set = [.../principals/users/bob]   ← already works
+
+[Bob logs into the calendar app]
+  → fetchDelegators()
+      PROPFIND /dav/principals/users/bob  → group-membership
+      finds: principals/users/alice/calendar-proxy-write
+      stores: delegatorUserIds = ['alice']
+
+  → fetchDelegatedCalendars()  (for each delegatorUserId)
+      PROPFIND /dav/calendars/alice/       ← BLOCKED today (403)
+      ↑ Fixed by Change 1 below (CalendarHome.getACL)   → 207 OK
+      maps each calendar → { ...calendarObj, isDelegated: true }
+      pushes into calendarsStore
+
+[CalendarList.vue renders]
+  → "Delegated" section shows all calendars where isDelegated === true
+  → Bob sees Alice's calendars in his sidebar ✓
+```
+
+Without Change 1 the `PROPFIND /dav/calendars/alice/` step returns **403 Forbidden** and
+no calendars are loaded. With Change 1 it returns **207 Multi-Status** and all of Alice's
+calendars populate the "Delegated" section of Bob's sidebar.
+
+---
+
+## Scope — three changes required
 
 | # | File | What to add |
 |---|------|-------------|
 | 1 | `apps/dav/lib/CalDAV/CalendarHome.php` | Override `getACL()` to grant `{DAV:}read` to the owner's `calendar-proxy-write` and `calendar-proxy-read` sub-principals |
 | 2 | `apps/dav/lib/Connector/Sabre/Principal.php` | Return an explicit `{DAV:}acl` for proxy-group principals so only the owner can PROPPATCH them |
+| 3 | `apps/dav/lib/Connector/Sabre/Principal.php` | Detect newly added delegates inside `updatePrincipal()` and send a notification email via `OCP\Mail\IMailer` |
 
-Do **not** modify any other file unless a test fixture requires it.
+Do **not** modify any other file unless a test fixture or DI container wiring requires it.
 
 ---
 
@@ -176,7 +209,137 @@ File: `apps/dav/tests/unit/Connector/Sabre/PrincipalTest.php`
 
 ---
 
-## SPDX headers
+## Change 3 — Email notification when a delegate is added (`apps/dav/lib/Connector/Sabre/Principal.php`)
+
+### Problem
+
+When Alice adds Bob as a delegate, Bob has no way of knowing until he logs in. An
+automated email notification ("You have been granted delegate access to Alice's calendars")
+lets Bob act immediately and avoids confusion.
+
+### Where to hook
+
+`Principal.php` already handles `PROPPATCH` on proxy-group principals through the
+`updatePrincipal()` method (or the method that calls `setGroupMemberSet` on the
+`ProxyMapper`). After writing the new member set to the database, compare the old
+membership list with the new one and send an email to every **newly added** member.
+
+### Constructor changes
+
+Add `OCP\Mail\IMailer` and `OCP\IUserManager` and `OCP\IL10N` (or
+`OCP\L10N\IFactory`) to the constructor's injected dependencies:
+
+```php
+public function __construct(
+    // ... existing parameters ...
+    private IMailer $mailer,
+    private IUserManager $userManager,
+    private IFactory $l10nFactory,
+) {}
+```
+
+> These services are already available in the DAV app's DI container. No new
+> container registrations are needed.
+
+### Implementation — diff inside `updatePrincipal()` (or equivalent proxy-write method)
+
+```php
+// Immediately before writing the new member set, snapshot the old set:
+$oldMembers = $this->proxyMapper->getProxiesOf($ownerUid, Proxy::PERMISSION_WRITE);
+$oldMemberUids = array_column($oldMembers, 'proxyId');
+
+// ... existing write call, e.g.:
+$this->proxyMapper->setProxiesOf($ownerUid, $newMemberUids, Proxy::PERMISSION_WRITE);
+
+// After the write, find newly added members and notify them:
+$addedUids = array_diff($newMemberUids, $oldMemberUids);
+foreach ($addedUids as $delegateUid) {
+    $this->sendDelegationNotification($ownerUid, $delegateUid);
+}
+```
+
+Add the private helper method to the same class:
+
+```php
+/**
+ * Send an email to a newly added delegate informing them of the delegation.
+ *
+ * @param string $ownerUid  User ID of the calendar owner who granted access
+ * @param string $delegateUid User ID of the user who was just granted access
+ */
+private function sendDelegationNotification(string $ownerUid, string $delegateUid): void {
+    $delegateUser = $this->userManager->get($delegateUid);
+    $ownerUser    = $this->userManager->get($ownerUid);
+
+    if ($delegateUser === null || $ownerUser === null) {
+        return;
+    }
+
+    $delegateEmail = $delegateUser->getEMailAddress();
+    if ($delegateEmail === null || $delegateEmail === '') {
+        return; // No email address on file — skip silently.
+    }
+
+    $l = $this->l10nFactory->get('dav');
+
+    $ownerDisplayName    = $ownerUser->getDisplayName() ?: $ownerUid;
+    $delegateDisplayName = $delegateUser->getDisplayName() ?: $delegateUid;
+
+    $subject = $l->t('%s has granted you access to their calendars', [$ownerDisplayName]);
+    $bodyText = $l->t(
+        'Hello %1$s,
+
+%2$s has added you as a calendar delegate. You can now view and manage their
+calendars in the Nextcloud Calendar app under the "Delegated" section.
+
+To remove yourself as a delegate, ask %2$s to revoke your access in their
+Calendar settings.',
+        [$delegateDisplayName, $ownerDisplayName]
+    );
+
+    try {
+        $message = $this->mailer->createMessage();
+        $message->setTo([$delegateEmail => $delegateDisplayName]);
+        $message->setSubject($subject);
+        $message->setPlainBody($bodyText);
+        $this->mailer->send($message);
+    } catch (\Exception $e) {
+        // Notification failure must never block the PROPPATCH response.
+        $this->logger->warning(
+            'Could not send delegation notification email',
+            ['owner' => $ownerUid, 'delegate' => $delegateUid, 'error' => $e->getMessage()]
+        );
+    }
+}
+```
+
+### Important constraints
+
+* **Never throw** from `sendDelegationNotification`. A failed email must not cause the
+  PROPPATCH to return an error — the delegation itself succeeded.
+* Only send notifications for **newly added** members (diff old vs new set). Do **not**
+  send on revocation; that is handled by the UI.
+* Respect privacy: only the delegate's own email address is used. Do not expose the
+  owner's email in the notification unless it is already part of the user's public
+  profile.
+
+### Tests to add
+
+File: `apps/dav/tests/unit/Connector/Sabre/PrincipalTest.php`
+
+1. **`testDelegationNotificationEmailIsSentToNewDelegate`** — mock `IMailer::send()` to
+   expect exactly one call; mock `IUserManager` to return valid users with email
+   addresses; call the proxy-write PROPPATCH with a net-new member; assert `send()` was
+   called once with the correct recipient and subject.
+2. **`testDelegationNotificationNotSentForExistingDelegate`** — add bob to alice's group
+   twice; assert `send()` is called only on the first invocation.
+3. **`testDelegationNotificationSkippedWhenNoEmail`** — set `getEMailAddress()` to return
+   `null`; assert `send()` is never called.
+4. **`testDelegationNotificationFailureDoesNotBlockProppatch`** — make `IMailer::send()`
+   throw a `\RuntimeException`; assert that `updatePrincipal()` still returns without
+   throwing and that the proxy row was written to the database.
+
+---
 
 All new or substantially modified PHP file blocks must use year **2026**:
 
@@ -206,16 +369,17 @@ The following are fully implemented and must not be modified:
 
 ## Verification checklist
 
-After implementing both changes, the following end-to-end flow must work:
+After implementing all three changes, the following end-to-end flow must work:
 
 1. User **alice** opens the Delegation modal in the calendar app and adds **bob** as a delegate.
    - `PROPPATCH /dav/principals/users/alice/calendar-proxy-write` succeeds (HTTP 207).
+   - **Bob receives an email**: "Alice has granted you access to their calendars" ← **Change 3**.
 2. User **bob** logs in; the calendar app calls `fetchDelegators()` which reads
    `PROPFIND /dav/principals/users/bob` → `group-membership` and finds `alice/calendar-proxy-write`.
 3. The app calls `fetchDelegatedCalendars()` which does
    `PROPFIND /dav/calendars/alice/` — this now succeeds (HTTP 207) because of **Change 1**.
-4. Bob can see Alice's calendars in the "Delegated" section of the sidebar.
+4. **Bob can see Alice's calendars in the "Delegated" section of his sidebar** ← confirmed by Change 1 + frontend store.
 5. Bob can create/edit events in Alice's calendars (existing Calendar ACL already handles this).
-6. Alice revokes Bob's access — `PROPPATCH` removes Bob from the proxy group.
+6. Alice revokes Bob's access — `PROPPATCH` removes Bob from the proxy group (no email sent on revocation).
 7. User **charlie** (unrelated) cannot modify Alice's proxy group — `PROPPATCH` returns 403
    because of **Change 2**.
