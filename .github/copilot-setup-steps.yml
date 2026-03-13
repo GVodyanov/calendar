@@ -1,0 +1,8 @@
+runs-on: ubuntu-latest
+steps:
+  - name: Install PHP dependencies
+    run: composer install --no-interaction --prefer-dist
+
+  - name: Install JS dependencies
+    run: npm ci
+
