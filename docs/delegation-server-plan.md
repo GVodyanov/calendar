@@ -22,11 +22,15 @@ implemented.
 [Bob logs into the calendar app]
   → fetchDelegators()
       PROPFIND /dav/principals/users/bob  → group-membership
-      finds: principals/users/alice/calendar-proxy-write
-      stores: delegatorUserIds = ['alice']
+      finds: .../principals/users/alice/calendar-proxy-write
+      strips /calendar-proxy-write suffix
+      stores: delegatorPrincipalUrls = ['.../principals/users/alice']
 
-  → fetchDelegatedCalendars()  (for each delegatorUserId)
-      PROPFIND /dav/calendars/alice/       ← BLOCKED today (403)
+  → fetchDelegatedCalendars()  (for each delegatorPrincipalUrl)
+      PROPFIND /dav/principals/users/alice  → calendar-home-set   ← CalDAV discovery
+      finds: /dav/calendars/alice/
+
+      PROPFIND /dav/calendars/alice/       ← BLOCKED today (403/404)
       ↑ Fixed by Change 1 below (CalendarHome.getACL)   → 207 OK
       maps each calendar → { ...calendarObj, isDelegated: true }
       pushes into calendarsStore
@@ -36,9 +40,38 @@ implemented.
   → Bob sees Alice's calendars in his sidebar ✓
 ```
 
-Without Change 1 the `PROPFIND /dav/calendars/alice/` step returns **403 Forbidden** and
-no calendars are loaded. With Change 1 it returns **207 Multi-Status** and all of Alice's
-calendars populate the "Delegated" section of Bob's sidebar.
+Without Change 1 the `PROPFIND /dav/calendars/alice/` step returns **403 Forbidden** which
+Nextcloud converts to **404 Not Found** (via `hideNodesFromListings`) and no calendars are
+loaded. With Change 1 it returns **207 Multi-Status** and all of Alice's calendars populate
+the "Delegated" section of Bob's sidebar.
+
+### Diagnosing the 404
+
+When the delegate's calendar app reports:
+
+```
+<?xml version="1.0" encoding="utf-8"?>
+(status 404)
+```
+
+during `fetchDelegatedCalendars`, the most common causes are:
+
+1. **Change 1 not applied** — `CalendarHome::getACL()` does not yet include the
+   proxy-principal entries.  Apply the server PR and clear any PHP opcode cache
+   (`opcache_reset()` or restart PHP-FPM / Apache).
+2. **ACL principal URI mismatch** — The URI returned by `$this->principalInfo['uri']`
+   differs in format (e.g. leading slash) from what Sabre's ACL plugin stores for Bob's
+   memberships.  Log both values and confirm they share the same format.
+3. **Delegation not actually stored** — Check the `oc_dav_cal_proxy` table for a row with
+   `owner_id = alice` and `proxy_id = bob`.  If the row is missing the PROPPATCH that set
+   the delegate may have failed silently; re-apply the delegation in the UI and check the
+   server error log for any `ArgumentCountError` or DI container exceptions during the
+   PROPPATCH.
+
+The frontend now discovers the calendar home URL via CalDAV principal PROPFIND
+(`calendar-home-set`, RFC 4791 §6.2.1) instead of constructing it from the user ID. Both
+approaches produce the same `/dav/calendars/{userId}/` URL in standard Nextcloud setups, so
+the fix is still required server-side.
 
 ---
 
@@ -243,10 +276,22 @@ public function __construct(
 
 ### Implementation — diff inside `updatePrincipal()` (or equivalent proxy-write method)
 
+> **Important**: the `$oldMemberUids` snapshot must be taken **before** writing the new
+> set and must use the same representation as `$newMemberUids` (both should be plain user
+> IDs extracted from the principal URIs, not full URI strings).  Comparing full URIs
+> against user IDs will always produce an empty diff and cause notifications to fire on
+> every PROPPATCH even when nothing changed.
+
 ```php
 // Immediately before writing the new member set, snapshot the old set:
 $oldMembers = $this->proxyMapper->getProxiesOf($ownerUid, Proxy::PERMISSION_WRITE);
 $oldMemberUids = array_column($oldMembers, 'proxyId');
+
+// Resolve the incoming principal URIs to plain user IDs so the diff is apples-to-apples.
+$newMemberUids = array_map(function(string $uri): string {
+    [, $uid] = \Sabre\Uri\split($uri);
+    return $uid;
+}, $incomingMemberUris);
 
 // ... existing write call, e.g.:
 $this->proxyMapper->setProxiesOf($ownerUid, $newMemberUids, Proxy::PERMISSION_WRITE);
@@ -376,7 +421,8 @@ After implementing all three changes, the following end-to-end flow must work:
    - **Bob receives an email**: "Alice has granted you access to their calendars" ← **Change 3**.
 2. User **bob** logs in; the calendar app calls `fetchDelegators()` which reads
    `PROPFIND /dav/principals/users/bob` → `group-membership` and finds `alice/calendar-proxy-write`.
-3. The app calls `fetchDelegatedCalendars()` which does
+3. The app calls `fetchDelegatedCalendars()` which first does
+   `PROPFIND /dav/principals/users/alice` → `calendar-home-set` (CalDAV discovery), then
    `PROPFIND /dav/calendars/alice/` — this now succeeds (HTTP 207) because of **Change 1**.
 4. **Bob can see Alice's calendars in the "Delegated" section of his sidebar** ← confirmed by Change 1 + frontend store.
 5. Bob can create/edit events in Alice's calendars (existing Calendar ACL already handles this).
