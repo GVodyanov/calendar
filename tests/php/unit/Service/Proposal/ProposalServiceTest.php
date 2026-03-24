@@ -550,7 +550,7 @@ class ProposalServiceTest extends TestCase {
 			->method('fetchByProposalId')
 			->with('testuser', 1)
 			->willReturn([$voteEntry]);
-		// calendar manager
+		// calendar manager – no existing calendar blocker so createFromString must be called
 		$calendar = $this->createMock(\OCP\Calendar\ICalendar::class);
 		if (interface_exists(\OCP\Calendar\ICreateFromString::class)) {
 			$calendar = $this->createMock(\OCP\Calendar\ICreateFromString::class);
@@ -561,6 +561,10 @@ class ProposalServiceTest extends TestCase {
 					$this->callback(fn ($data) => str_contains($data, 'SUMMARY:Convert Proposal')));
 		}
 		$this->calendarManager->method('getPrimaryCalendar')->with('testuser')->willReturn($calendar);
+		// no existing blocker event (empty search results in all calendars)
+		$this->calendarManager->method('getCalendarsForPrincipal')
+			->with('principals/users/testuser')
+			->willReturn([]);
 
 		// expectations
 		$this->proposalVoteMapper->expects($this->once())
@@ -579,6 +583,81 @@ class ProposalServiceTest extends TestCase {
 		// test and assertions
 		$this->service->convertProposal($this->user, 1, 10, ['attendancePreset' => true]);
 		$this->addToAssertionCount(1); // If we reached this point, the test is successfully completed
+	}
+
+	public function testConvertProposalWithExistingBlockerDoesNotCallCreateFromString(): void {
+		// Regression test: when a calendar blocker event already exists for the proposal,
+		// convertProposal must NOT call createFromString (which would cause a duplicate-UID
+		// constraint violation on oc_calendarobjects).  Instead the existing event is updated
+		// in-place via the CalDAV PUT path.  The CalDAV PUT step itself is performed through
+		// the InvitationResponseServer which cannot be mocked in unit tests, so we only
+		// assert the parts that are accessible: that createFromString is never invoked.
+
+		// mock objects
+		$proposalEntry = $this->createProposalEntry(1, 'Convert Proposal With Blocker');
+		$proposalEntry->setDuration(60);
+		$proposalEntry->setUuid('uuid-blocker-test');
+		$dateEntry = new ProposalDateEntry();
+		$dateEntry->setId(10);
+		$dateEntry->setPid(1);
+		$dateEntry->setUid('testuser');
+		$dateEntry->setDate((new \DateTimeImmutable('+1 day'))->getTimestamp());
+
+		// mock methods
+		$this->user->method('getEMailAddress')->willReturn('organizer@example.com');
+		$this->user->method('getDisplayName')->willReturn('Organizer');
+		$this->proposalMapper->expects($this->once())
+			->method('fetchById')
+			->with('testuser', 1)
+			->willReturn($proposalEntry);
+		$this->proposalParticipantMapper->expects($this->once())
+			->method('fetchByProposalId')
+			->with('testuser', 1)
+			->willReturn([]);
+		$this->proposalDateMapper->expects($this->once())
+			->method('fetchByProposalId')
+			->with('testuser', 1)
+			->willReturn([$dateEntry]);
+		$this->proposalVoteMapper->expects($this->once())
+			->method('fetchByProposalId')
+			->with('testuser', 1)
+			->willReturn([]);
+
+		// primary calendar (required even when blocker found)
+		$primaryCalendar = $this->createMock(\OCP\Calendar\ICreateFromString::class);
+		$primaryCalendar->method('isDeleted')->willReturn(false);
+		// createFromString must NOT be called because the blocker update path is taken
+		$primaryCalendar->expects($this->never())->method('createFromString');
+		$this->calendarManager->method('getPrimaryCalendar')->with('testuser')->willReturn($primaryCalendar);
+
+		// simulate an existing blocker event in the user's calendar; assert that
+		// getCalendarsForPrincipal is actually called (confirms findCalendarBlocker ran)
+		$mockBlockerCalendar = $this->createMock(\OCP\Calendar\ICalendar::class);
+		$mockBlockerCalendar->method('getUri')->willReturn('personal');
+		$mockBlockerCalendar->method('search')
+			->with('', [], ['uid' => 'uuid-blocker-test'])
+			->willReturn([['uri' => 'blocker-uuid-blocker-test.ics']]);
+		$this->calendarManager->expects($this->atLeastOnce())
+			->method('getCalendarsForPrincipal')
+			->with('principals/users/testuser')
+			->willReturn([$mockBlockerCalendar]);
+
+		// proposal cleanup would happen after the CalDAV PUT step, but since the
+		// InvitationResponseServer cannot be instantiated in a unit test the exception
+		// thrown there prevents cleanup from running – do not assert cleanup here.
+
+		// The InvitationResponseServer PUT step cannot be exercised in a unit test (it
+		// requires a live Nextcloud installation).  The critical assertion is ->never() on
+		// createFromString above: if the pre-fix code path were taken (delete + insert),
+		// createFromString would be called and PHPUnit would fail on that expectation.
+		try {
+			$this->service->convertProposal($this->user, 1, 10);
+		} catch (\Error|\RuntimeException|\Exception $e) {
+			// Expected: InvitationResponseServer cannot be set up without a running
+			// Nextcloud server.  PHPUnit's ->never() expectation on createFromString
+			// is still enforced by the mock framework after this catch block.
+		}
+		$this->addToAssertionCount(1);
 	}
 
 	public function testConvertProposalDateNotFound(): void {
